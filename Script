@@ -1,0 +1,1412 @@
+-- ═══════════════════════════════════════════════════════════════
+-- SaveInstance Utility
+-- Visual structure extraction for the running experience.
+-- ═══════════════════════════════════════════════════════════════
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local LogService = game:GetService("LogService")
+local Tween = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+local PG = LP:WaitForChild("PlayerGui")
+
+local CAP = {
+saveinstance = type(saveinstance) == "function",
+writefile = type(writefile) == "function",
+readfile = type(readfile) == "function",
+listfiles = type(listfiles) == "function",
+makefolder = type(makefolder) == "function",
+isfolder = type(isfolder) == "function",
+isfile = type(isfile) == "function",
+getsize = type(getsize) == "function",
+setclipboard = type(setclipboard) == "function",
+}
+
+if not CAP.saveinstance then
+warn("[SaveInstance] 'saveinstance' is not exposed by this executor.")
+return
+end
+
+local isTouch = UIS.TouchEnabled
+local isDesktop = UIS.KeyboardEnabled
+
+-- ─── Palette ───────────────────────────────────────────────────
+local C = {
+BG = Color3.fromRGB(10, 10, 12),
+SURFACE = Color3.fromRGB(17, 17, 20),
+CARD = Color3.fromRGB(22, 22, 26),
+HOVER = Color3.fromRGB(28, 28, 33),
+BORDER = Color3.fromRGB(34, 34, 40),
+BORDER_HI = Color3.fromRGB(54, 54, 64),
+ACCENT = Color3.fromRGB(88, 166, 255),
+ACCENT_D = Color3.fromRGB(42, 82, 135),
+TEXT = Color3.fromRGB(236, 236, 242),
+TEXT_DIM = Color3.fromRGB(140, 140, 152),
+TEXT_MUT = Color3.fromRGB(84, 84, 96),
+OK = Color3.fromRGB(88, 200, 130),
+WARN = Color3.fromRGB(230, 180, 80),
+ERR = Color3.fromRGB(220, 90, 90),
+INFO = Color3.fromRGB(120, 170, 230),
+}
+
+local F = {
+REG = Enum.Font.Gotham,
+MED = Enum.Font.GothamMedium,
+BOLD = Enum.Font.GothamBold,
+MONO = Enum.Font.Code,
+}
+
+-- ─── Helpers ───────────────────────────────────────────────────
+local function corner(p, r)
+local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 6); c.Parent = p
+return c
+end
+
+local function stroke(p, col, t)
+local s = Instance.new("UIStroke")
+s.Color = col or C.BORDER
+s.Thickness = t or 1
+s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+s.Parent = p
+return s
+end
+
+local function mk(parent, class, props)
+local i = Instance.new(class)
+for k, v in pairs(props) do i[k] = v end
+i.Parent = parent
+return i
+end
+
+local function draggable(f)
+local on, s0, p0
+f.InputBegan:Connect(function(i)
+if i.UserInputType == Enum.UserInputType.MouseButton1
+or i.UserInputType == Enum.UserInputType.Touch then
+on = true; s0 = i.Position; p0 = f.Position
+end
+end)
+UIS.InputChanged:Connect(function(i)
+if on and (i.UserInputType == Enum.UserInputType.MouseMovement
+or i.UserInputType == Enum.UserInputType.Touch) then
+local d = i.Position - s0
+f.Position = UDim2.new(p0.X.Scale, p0.X.Offset + d.X,
+p0.Y.Scale, p0.Y.Offset + d.Y)
+end
+end)
+UIS.InputEnded:Connect(function(i)
+if i.UserInputType == Enum.UserInputType.MouseButton1
+or i.UserInputType == Enum.UserInputType.Touch then on = false end
+end)
+end
+
+local function fmtBytes(n)
+if not n then return "--" end
+if n < 1024 then return n .. " B" end
+if n < 1048576 then return string.format("%.1f KB", n / 1024) end
+if n < 1073741824 then return string.format("%.2f MB", n / 1048576) end
+return string.format("%.2f GB", n / 1073741824)
+end
+
+local function fmtTime(s)
+s = math.floor(s)
+if s < 60 then return s .. "s" end
+return string.format("%dm %02ds", math.floor(s / 60), s % 60)
+end
+
+local function safeFileSize(path)
+if CAP.getsize then
+local ok, s = pcall(getsize, path)
+if ok and type(s) == "number" then return s end
+end
+if not CAP.readfile then return nil end
+local ok, content = pcall(readfile, path)
+if not ok or not content then return nil end
+return #content
+end
+
+local function ensureFolder(path)
+if not CAP.makefolder then return end
+local cur = ""
+for seg in path:gmatch("[^/]+") do
+cur = (cur == "") and seg or (cur .. "/" .. seg)
+if CAP.isfolder and not isfolder(cur) then pcall(makefolder, cur) end
+end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- CONSOLE capture
+-- ═══════════════════════════════════════════════════════════════
+
+local MAX_LOGS = 500
+local logs = {}
+local listeners = {}
+local queue = {}
+
+local function kindOf(mt)
+if mt == Enum.MessageType.MessageError then return "ERR" end
+if mt == Enum.MessageType.MessageWarning then return "WARN" end
+if mt == Enum.MessageType.MessageOutput then return "OUT" end
+return "INFO"
+end
+
+local function pushLog(msg, kind, time)
+local entry = { msg = msg, kind = kind, time = time or os.time() }
+table.insert(logs, entry)
+if #logs > MAX_LOGS then table.remove(logs, 1) end
+for _, fn in ipairs(listeners) do pcall(fn, entry) end
+end
+
+pcall(function()
+for _, e in ipairs(LogService:GetLogHistory()) do
+table.insert(logs, { msg = e.message, kind = kindOf(e.messageType), time = e.timestamp })
+end
+while #logs > MAX_LOGS do table.remove(logs, 1) end
+end)
+
+LogService.MessageOut:Connect(function(msg, mt)
+table.insert(queue, { msg = msg, kind = kindOf(mt) })
+end)
+
+RunService.Heartbeat:Connect(function()
+if #queue == 0 then return end
+local batch = math.min(20, #queue)
+for i = 1, batch do
+local e = table.remove(queue, 1)
+pushLog(e.msg, e.kind)
+end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- STATE
+-- ═══════════════════════════════════════════════════════════════
+
+local opts = {
+excludeScripts = true,
+saveThumbnails = false,
+cacheAssets = true,
+ignoreDefaults = true,
+removeOutlines = false,
+includeTerrain = true,
+includeSounds = false,
+decompile = false,
+mode = "optimized",
+maxSizeMB = 80,
+}
+
+local filterState = "ALL"
+local autoScroll = true
+local running = false
+local minimized = false
+local lastFolderPath = nil
+
+-- ═══════════════════════════════════════════════════════════════
+-- SHELL
+-- ═══════════════════════════════════════════════════════════════
+
+local old = PG:FindFirstChild("SaveInstanceUI")
+if old then old:Destroy() end
+
+local gui = mk(PG, "ScreenGui", {
+Name = "SaveInstanceUI",
+ResetOnSpawn = false,
+DisplayOrder = 500,
+ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+-- ── Restore handle (mobile) ──────────────────────────────────
+local restoreHandle = mk(gui, "TextButton", {
+Name = "RestoreHandle",
+Size = UDim2.new(0, 14, 0, 64),
+Position = UDim2.new(0, 0, 0.5, -32),
+BackgroundColor3 = C.ACCENT,
+BackgroundTransparency = 0.35,
+Text = "",
+BorderSizePixel = 0,
+Visible = false,
+AutoButtonColor = false,
+ZIndex = 10,
+})
+corner(restoreHandle, 7)
+
+-- ── Toast ────────────────────────────────────────────────────
+local function showToast(text, duration)
+duration = duration or 4
+for _, t in ipairs(gui:GetChildren()) do
+if t.Name == "Toast" then t:Destroy() end
+end
+
+local toast = mk(gui, "Frame", {
+Name = "Toast",
+Size = UDim2.new(0, 360, 0, 48),
+Position = UDim2.new(0.5, -180, 1, -96),
+BackgroundColor3 = C.CARD,
+BorderSizePixel = 0,
+})
+corner(toast, 10); stroke(toast, C.BORDER_HI, 1)
+
+mk(toast, "TextLabel", {
+Size = UDim2.new(1, -24, 1, 0),
+Position = UDim2.new(0, 12, 0, 0),
+BackgroundTransparency = 1,
+Text = text,
+TextColor3 = C.TEXT,
+TextSize = 12,
+Font = F.MED,
+TextXAlignment = Enum.TextXAlignment.Center,
+TextYAlignment = Enum.TextYAlignment.Center,
+})
+
+local tap = mk(toast, "TextButton", {
+Size = UDim2.new(1, 0, 1, 0),
+BackgroundTransparency = 1,
+Text = "",
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+tap.MouseButton1Click:Connect(function()
+if toast and toast.Parent then toast:Destroy() end
+if minimized then
+minimized = false
+win.Visible = true
+restoreHandle.Visible = false
+end
+end)
+
+task.delay(duration, function()
+if toast and toast.Parent then
+Tween:Create(toast, TweenInfo.new(0.5), {
+BackgroundTransparency = 1,
+}):Play()
+for _, ch in ipairs(toast:GetDescendants()) do
+if ch:IsA("TextLabel") then
+Tween:Create(ch, TweenInfo.new(0.5), { TextTransparency = 1 }):Play()
+elseif ch:IsA("UIStroke") then
+Tween:Create(ch, TweenInfo.new(0.5), { Transparency = 1 }):Play()
+end
+end
+task.wait(0.5)
+if toast and toast.Parent then toast:Destroy() end
+end
+end)
+end
+
+-- ── Main window ──────────────────────────────────────────────
+local win = mk(gui, "Frame", {
+Size = UDim2.new(0, 640, 0, 620),
+Position = UDim2.new(0, 60, 0, 60),
+BackgroundColor3 = C.BG,
+BorderSizePixel = 0,
+ClipsDescendants = true,
+})
+corner(win, 12)
+stroke(win, C.BORDER_HI, 1)
+
+-- ── Header ───────────────────────────────────────────────────
+local header = mk(win, "Frame", {
+Size = UDim2.new(1, 0, 0, 56),
+BackgroundTransparency = 1,
+})
+
+local logo = mk(header, "Frame", {
+Size = UDim2.new(0, 32, 0, 32),
+Position = UDim2.new(0, 18, 0, 12),
+BackgroundColor3 = C.ACCENT,
+BorderSizePixel = 0,
+})
+corner(logo, 8)
+mk(logo, "TextLabel", {
+Size = UDim2.new(1, 0, 1, 0),
+BackgroundTransparency = 1,
+Text = "S",
+TextColor3 = C.TEXT,
+TextSize = 16,
+Font = F.BOLD,
+})
+
+mk(header, "TextLabel", {
+Size = UDim2.new(1, -140, 0, 18),
+Position = UDim2.new(0, 60, 0, 12),
+BackgroundTransparency = 1,
+Text = "SaveInstance",
+TextColor3 = C.TEXT,
+TextSize = 14,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+mk(header, "TextLabel", {
+Size = UDim2.new(1, -140, 0, 14),
+Position = UDim2.new(0, 60, 0, 29),
+BackgroundTransparency = 1,
+Text = "Visual extraction",
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.REG,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local function headerBtn(xOff, text)
+local b = mk(header, "TextButton", {
+Size = UDim2.new(0, 32, 0, 32),
+Position = UDim2.new(1, xOff, 0, 12),
+BackgroundColor3 = C.SURFACE,
+Text = text,
+TextColor3 = C.TEXT_DIM,
+TextSize = 15,
+Font = F.BOLD,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(b, 8)
+stroke(b, C.BORDER, 1)
+b.MouseEnter:Connect(function()
+Tween:Create(b, TweenInfo.new(0.12), {
+BackgroundColor3 = C.CARD, TextColor3 = C.TEXT,
+}):Play()
+end)
+b.MouseLeave:Connect(function()
+Tween:Create(b, TweenInfo.new(0.12), {
+BackgroundColor3 = C.SURFACE, TextColor3 = C.TEXT_DIM,
+}):Play()
+end)
+return b
+end
+
+local minBtn = headerBtn(-84, "-")
+local closeBtn = headerBtn(-46, "x")
+
+local function toggleMinimize(state)
+if state == nil then state = not minimized end
+minimized = state
+win.Visible = not minimized
+
+if minimized then
+if isTouch then
+restoreHandle.Visible = true
+showToast("Minimized - tap the edge strip or this toast", 5)
+else
+showToast("Minimized - press RightShift to restore", 5)
+end
+else
+restoreHandle.Visible = false
+for _, t in ipairs(gui:GetChildren()) do
+if t.Name == "Toast" then t:Destroy() end
+end
+end
+end
+
+restoreHandle.MouseButton1Click:Connect(function() toggleMinimize(false) end)
+minBtn.MouseButton1Click:Connect(function() toggleMinimize(true) end)
+closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+UIS.InputBegan:Connect(function(input, gpe)
+if gpe then return end
+if input.KeyCode == Enum.KeyCode.RightShift and minimized then
+toggleMinimize(false)
+end
+end)
+
+draggable(win)
+
+mk(win, "Frame", {
+Size = UDim2.new(1, 0, 0, 1),
+Position = UDim2.new(0, 0, 0, 56),
+BackgroundColor3 = C.BORDER,
+BorderSizePixel = 0,
+})
+
+-- ═══════════════════════════════════════════════════════════════
+-- TABS
+-- ═══════════════════════════════════════════════════════════════
+
+local tabBar = mk(win, "Frame", {
+Size = UDim2.new(1, -36, 0, 36),
+Position = UDim2.new(0, 18, 0, 66),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+})
+corner(tabBar, 8)
+
+local tabNames = { "EXTRACT", "CONSOLE", "OUTPUT", "HELP" }
+local tabW = 100
+local tabs = {}
+local activeName = nil
+
+local contentArea = mk(win, "Frame", {
+Size = UDim2.new(1, 0, 1, -110),
+Position = UDim2.new(0, 0, 0, 110),
+BackgroundTransparency = 1,
+})
+
+local function selectTab(name)
+for n, t in pairs(tabs) do
+t.btn.TextColor3 = (n == name) and C.TEXT or C.TEXT_DIM
+t.content.Visible = (n == name)
+Tween:Create(t.btn, TweenInfo.new(0.15), {
+BackgroundColor3 = (n == name) and C.ACCENT or C.SURFACE,
+}):Play()
+end
+activeName = name
+end
+
+for i, name in ipairs(tabNames) do
+local btn = mk(tabBar, "TextButton", {
+Size = UDim2.new(0, tabW, 1, -6),
+Position = UDim2.new(0, 3 + (i - 1) * tabW, 0, 3),
+BackgroundColor3 = C.SURFACE,
+Text = name,
+TextColor3 = C.TEXT_DIM,
+TextSize = 11,
+Font = F.BOLD,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(btn, 6)
+
+local content = mk(contentArea, "Frame", {
+Size = UDim2.new(1, 0, 1, 0),
+BackgroundTransparency = 1,
+Visible = false,
+})
+
+tabs[name] = { btn = btn, content = content }
+btn.MouseButton1Click:Connect(function() selectTab(name) end)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- WIDGETS
+-- ═══════════════════════════════════════════════════════════════
+
+local function sectionHeader(parent, text, order)
+local row = mk(parent, "Frame", {
+Size = UDim2.new(1, 0, 0, 20),
+BackgroundTransparency = 1,
+LayoutOrder = order,
+})
+mk(row, "TextLabel", {
+Size = UDim2.new(1, 0, 1, 0),
+BackgroundTransparency = 1,
+Text = text,
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+return row
+end
+
+local function toggleRow(parent, order, label, desc, key, initialDisabled)
+local row = mk(parent, "Frame", {
+Size = UDim2.new(1, 0, 0, 46),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+LayoutOrder = order,
+})
+corner(row, 8)
+
+local lbl = mk(row, "TextLabel", {
+Size = UDim2.new(1, -80, 0, 18),
+Position = UDim2.new(0, 14, 0, 7),
+BackgroundTransparency = 1,
+Text = label,
+TextColor3 = C.TEXT,
+TextSize = 12,
+Font = F.MED,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local sub = mk(row, "TextLabel", {
+Size = UDim2.new(1, -80, 0, 14),
+Position = UDim2.new(0, 14, 0, 23),
+BackgroundTransparency = 1,
+Text = desc,
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.REG,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local track = mk(row, "Frame", {
+Size = UDim2.new(0, 34, 0, 18),
+Position = UDim2.new(1, -50, 0.5, -9),
+BackgroundColor3 = opts[key] and C.ACCENT or C.HOVER,
+BorderSizePixel = 0,
+})
+corner(track, 9)
+
+local knob = mk(track, "Frame", {
+Size = UDim2.new(0, 14, 0, 14),
+Position = opts[key] and UDim2.new(1, -16, 0.5, -7)
+or UDim2.new(0, 2, 0.5, -7),
+BackgroundColor3 = C.TEXT,
+BorderSizePixel = 0,
+})
+corner(knob, 7)
+
+local click = mk(row, "TextButton", {
+Size = UDim2.new(1, 0, 1, 0),
+BackgroundTransparency = 1,
+Text = "",
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+
+local disabled = initialDisabled or false
+
+local function setVisual(v)
+Tween:Create(track, TweenInfo.new(0.15), {
+BackgroundColor3 = v and C.ACCENT or C.HOVER,
+}):Play()
+Tween:Create(knob, TweenInfo.new(0.15), {
+Position = v and UDim2.new(1, -16, 0.5, -7)
+or UDim2.new(0, 2, 0.5, -7),
+}):Play()
+end
+
+local function setEnabled(en)
+disabled = not en
+lbl.TextColor3 = en and C.TEXT or C.TEXT_MUT
+sub.TextColor3 = en and C.TEXT_MUT or C.BORDER_HI
+row.BackgroundTransparency = en and 0 or 0.35
+click.Active = en
+if not en then
+setVisual(false)
+opts[key] = false
+end
+end
+
+click.MouseButton1Click:Connect(function()
+if disabled then return end
+opts[key] = not opts[key]
+setVisual(opts[key])
+end)
+
+if initialDisabled then setEnabled(false) end
+
+return {
+row = row,
+setEnabled = setEnabled,
+isEnabled = function() return not disabled end,
+setValue = function(v)
+opts[key] = v
+setVisual(v)
+end,
+}
+end
+
+local function segmentedRow(parent, order, label, desc, key, values)
+local row = mk(parent, "Frame", {
+Size = UDim2.new(1, 0, 0, 60),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+LayoutOrder = order,
+})
+corner(row, 8)
+
+mk(row, "TextLabel", {
+Size = UDim2.new(1, -20, 0, 16),
+Position = UDim2.new(0, 14, 0, 8),
+BackgroundTransparency = 1,
+Text = label,
+TextColor3 = C.TEXT,
+TextSize = 12,
+Font = F.MED,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+mk(row, "TextLabel", {
+Size = UDim2.new(1, -20, 0, 12),
+Position = UDim2.new(0, 14, 0, 24),
+BackgroundTransparency = 1,
+Text = desc,
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.REG,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local cont = mk(row, "Frame", {
+Size = UDim2.new(1, -28, 0, 20),
+Position = UDim2.new(0, 14, 0, 38),
+BackgroundTransparency = 1,
+})
+mk(cont, "UIListLayout", {
+FillDirection = Enum.FillDirection.Horizontal,
+Padding = UDim.new(0, 6),
+SortOrder = Enum.SortOrder.LayoutOrder,
+})
+
+local btns = {}
+local function refresh()
+for v, b in pairs(btns) do
+b.BackgroundColor3 = (opts[key] == v) and C.ACCENT_D or C.HOVER
+b.TextColor3 = (opts[key] == v) and C.TEXT or C.TEXT_DIM
+end
+end
+
+for i, v in ipairs(values) do
+local b = mk(cont, "TextButton", {
+Size = UDim2.new(0, math.floor(400 / #values) - 6, 1, 0),
+BackgroundColor3 = (opts[key] == v) and C.ACCENT_D or C.HOVER,
+Text = v,
+TextColor3 = (opts[key] == v) and C.TEXT or C.TEXT_DIM,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+LayoutOrder = i,
+AutoButtonColor = false,
+})
+corner(b, 5)
+btns[v] = b
+b.MouseButton1Click:Connect(function()
+opts[key] = v
+refresh()
+end)
+end
+
+return { row = row, refresh = refresh }
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- EXTRACT TAB
+-- ═══════════════════════════════════════════════════════════════
+
+local extractTab = tabs["EXTRACT"].content
+
+local scroll = mk(extractTab, "ScrollingFrame", {
+Size = UDim2.new(1, -36, 1, -20),
+Position = UDim2.new(0, 18, 0, 10),
+BackgroundTransparency = 1,
+BorderSizePixel = 0,
+ScrollBarThickness = 4,
+ScrollBarImageColor3 = C.BORDER_HI,
+CanvasSize = UDim2.new(0, 0, 0, 0),
+AutomaticCanvasSize = Enum.AutomaticSize.Y,
+})
+mk(scroll, "UIPadding", {
+PaddingBottom = UDim.new(0, 16),
+PaddingRight = UDim.new(0, 6),
+})
+mk(scroll, "UIListLayout", {
+Padding = UDim.new(0, 6),
+SortOrder = Enum.SortOrder.LayoutOrder,
+})
+
+-- Presets
+sectionHeader(scroll, "PRESET", 1)
+
+local presetRow = mk(scroll, "Frame", {
+Size = UDim2.new(1, 0, 0, 38),
+BackgroundTransparency = 1,
+LayoutOrder = 2,
+})
+mk(presetRow, "UIListLayout", {
+FillDirection = Enum.FillDirection.Horizontal,
+Padding = UDim.new(0, 6),
+SortOrder = Enum.SortOrder.LayoutOrder,
+})
+
+local PRESETS = {
+Minimal = {
+excludeScripts = true, saveThumbnails = false, cacheAssets = false,
+ignoreDefaults = true, removeOutlines = true, includeTerrain = false,
+includeSounds = false, decompile = false, mode = "optimized", maxSizeMB = 30,
+},
+Designer = {
+excludeScripts = true, saveThumbnails = false, cacheAssets = true,
+ignoreDefaults = true, removeOutlines = true, includeTerrain = true,
+includeSounds = false, decompile = false, mode = "optimized", maxSizeMB = 120,
+},
+Full = {
+excludeScripts = false, saveThumbnails = true, cacheAssets = true,
+ignoreDefaults = false, removeOutlines = false, includeTerrain = true,
+includeSounds = true, decompile = false, mode = "full", maxSizeMB = 500,
+},
+}
+
+local toggleRefs = {}
+local presetSegmented
+
+local function applyPreset(name)
+local p = PRESETS[name]
+if not p then return end
+for k, v in pairs(p) do opts[k] = v end
+for key, ref in pairs(toggleRefs) do
+if ref.isEnabled and ref.isEnabled() then
+ref.setValue(opts[key])
+end
+end
+if presetSegmented then presetSegmented.refresh() end
+refreshEstimate()
+end
+
+for i, pname in ipairs({ "Minimal", "Designer", "Full" }) do
+local b = mk(presetRow, "TextButton", {
+Size = UDim2.new(0, 100, 0, 30),
+BackgroundColor3 = C.SURFACE,
+Text = pname,
+TextColor3 = C.TEXT_DIM,
+TextSize = 11,
+Font = F.MED,
+BorderSizePixel = 0,
+LayoutOrder = i,
+AutoButtonColor = false,
+})
+corner(b, 6)
+stroke(b, C.BORDER, 1)
+b.MouseButton1Click:Connect(function()
+applyPreset(pname)
+b.BackgroundColor3 = C.ACCENT_D
+b.TextColor3 = C.TEXT
+task.delay(0.4, function()
+Tween:Create(b, TweenInfo.new(0.3), {
+BackgroundColor3 = C.SURFACE, TextColor3 = C.TEXT_DIM,
+}):Play()
+end)
+end)
+end
+
+-- Content
+sectionHeader(scroll, "CONTENT", 3)
+
+toggleRefs.excludeScripts = toggleRow(scroll, 4, "Exclude scripts",
+"Keep visual data only", "excludeScripts", false)
+toggleRefs.includeTerrain = toggleRow(scroll, 5, "Include terrain",
+"Voxel ground and water", "includeTerrain", false)
+toggleRefs.includeSounds = toggleRow(scroll, 6, "Include sounds",
+"Sound instances and references", "includeSounds", false)
+toggleRefs.saveThumbnails = toggleRow(scroll, 7, "Save thumbnails",
+"Pre-rendered model previews", "saveThumbnails", false)
+
+sectionHeader(scroll, "SERIALIZATION", 8)
+
+toggleRefs.cacheAssets = toggleRow(scroll, 9, "Cache external assets",
+"Download textures and meshes for offline use", "cacheAssets", false)
+toggleRefs.ignoreDefaults = toggleRow(scroll, 10, "Ignore default properties",
+"Smaller file - omits unchanged values", "ignoreDefaults", false)
+toggleRefs.removeOutlines = toggleRow(scroll, 11, "Remove selection outlines",
+"Strip SelectionBox objects", "removeOutlines", false)
+toggleRefs.decompile = toggleRow(scroll, 12, "Decompile scripts",
+"Requires scripts to be included", "decompile", true)
+
+local function syncDecompileState()
+if not toggleRefs.decompile then return end
+if opts.excludeScripts then
+toggleRefs.decompile.setEnabled(false)
+else
+toggleRefs.decompile.setEnabled(true)
+end
+end
+
+task.spawn(function()
+local last = opts.excludeScripts
+RunService.Heartbeat:Connect(function()
+if opts.excludeScripts ~= last then
+last = opts.excludeScripts
+syncDecompileState()
+end
+end)
+end)
+
+sectionHeader(scroll, "MODE", 13)
+presetSegmented = segmentedRow(scroll, 14, "Serialization mode",
+"optimized balances speed and size - full preserves everything",
+"mode", { "optimized", "full" })
+
+sectionHeader(scroll, "FILE SIZE", 15)
+
+local sizeCard = mk(scroll, "Frame", {
+Size = UDim2.new(1, 0, 0, 118),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+LayoutOrder = 16,
+})
+corner(sizeCard, 8)
+
+mk(sizeCard, "TextLabel", {
+Size = UDim2.new(0, 100, 0, 14),
+Position = UDim2.new(0, 14, 0, 10),
+BackgroundTransparency = 1,
+Text = "Max size (MB)",
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local sizeInput = mk(sizeCard, "TextBox", {
+Size = UDim2.new(0, 80, 0, 28),
+Position = UDim2.new(0, 14, 0, 28),
+BackgroundColor3 = C.HOVER,
+BorderSizePixel = 0,
+Text = tostring(opts.maxSizeMB),
+TextColor3 = C.TEXT,
+TextSize = 12,
+Font = F.MED,
+ClearTextOnFocus = false,
+})
+corner(sizeInput, 6)
+local sizeStroke = stroke(sizeInput, C.BORDER, 1)
+
+sizeInput.FocusLost:Connect(function()
+local n = tonumber(sizeInput.Text)
+if n and n >= 5 and n <= 2048 then
+opts.maxSizeMB = math.floor(n)
+sizeInput.Text = tostring(opts.maxSizeMB)
+sizeInput.TextColor3 = C.TEXT
+sizeStroke.Color = C.BORDER
+else
+sizeInput.Text = tostring(opts.maxSizeMB)
+sizeInput.TextColor3 = C.ERR
+sizeStroke.Color = C.ERR
+task.delay(1.5, function()
+sizeInput.TextColor3 = C.TEXT
+sizeStroke.Color = C.BORDER
+end)
+end
+end)
+
+mk(sizeCard, "TextLabel", {
+Size = UDim2.new(1, -110, 0, 14),
+Position = UDim2.new(0, 104, 0, 10),
+BackgroundTransparency = 1,
+Text = "ESTIMATE",
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local estimateMain = mk(sizeCard, "TextLabel", {
+Size = UDim2.new(1, -140, 0, 20),
+Position = UDim2.new(0, 104, 0, 26),
+BackgroundTransparency = 1,
+Text = "--",
+TextColor3 = C.TEXT,
+TextSize = 15,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local estimateSub = mk(sizeCard, "TextLabel", {
+Size = UDim2.new(1, -140, 0, 14),
+Position = UDim2.new(0, 104, 0, 46),
+BackgroundTransparency = 1,
+Text = "Calculating...",
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.REG,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local refreshBtn = mk(sizeCard, "TextButton", {
+Size = UDim2.new(0, 74, 0, 26),
+Position = UDim2.new(0, 14, 0, 66),
+BackgroundColor3 = C.HOVER,
+Text = "REFRESH",
+TextColor3 = C.TEXT_DIM,
+TextSize = 10,
+Font = F.BOLD,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(refreshBtn, 6)
+
+local estimating = false
+function refreshEstimate()
+if estimating then return end
+estimating = true
+refreshBtn.Text = "SCANNING"
+refreshBtn.TextColor3 = C.ACCENT
+task.spawn(function()
+local bytes, count, assets = 0, 0, 0
+for _, d in ipairs(game:GetDescendants()) do
+count += 1
+local cls = d.ClassName
+if cls == "MeshPart" then bytes += 2000; assets += 1
+elseif cls == "Part" or cls == "WedgePart" or cls == "TrussPart"
+or cls == "CornerWedgePart" or cls == "SpawnLocation" then
+bytes += 600
+if d:FindFirstChildOfClass("Decal") or d:FindFirstChildOfClass("Texture") then assets += 1 end
+if d:FindFirstChildOfClass("SpecialMesh") then assets += 1 end
+elseif cls == "Decal" or cls == "Texture" then bytes += 300; assets += 1
+elseif cls == "SurfaceAppearance" then bytes += 800; assets += 3
+elseif cls == "Terrain" then
+if opts.includeTerrain then bytes += 8000 end
+elseif cls == "TextLabel" or cls == "TextButton" or cls == "TextBox" then bytes += 350
+elseif cls == "ImageLabel" or cls == "ImageButton" then bytes += 300; assets += 1
+elseif cls == "Frame" or cls == "ScrollingFrame" then bytes += 250
+elseif cls == "Sound" then
+if opts.includeSounds then bytes += 200; assets += 1 end
+elseif cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam" then bytes += 400
+elseif cls == "Script" or cls == "LocalScript" or cls == "ModuleScript" then
+if not opts.excludeScripts then
+local ok, src = pcall(function() return d.Source end)
+bytes += (ok and #tostring(src) or 500)
+end
+else bytes += 180
+end
+end
+if opts.cacheAssets then bytes = bytes * 1.4 end
+if opts.ignoreDefaults then bytes = bytes * 0.6 end
+estimateMain.Text = fmtBytes(math.floor(bytes))
+estimateSub.Text = string.format("%s instances | %s assets",
+tostring(count), tostring(assets))
+estimating = false
+refreshBtn.Text = "REFRESH"
+refreshBtn.TextColor3 = C.TEXT_DIM
+end)
+end
+refreshBtn.MouseButton1Click:Connect(refreshEstimate)
+
+sectionHeader(scroll, "EXECUTION", 17)
+
+local runCard = mk(scroll, "Frame", {
+Size = UDim2.new(1, 0, 0, 100),
+BackgroundTransparency = 1,
+LayoutOrder = 18,
+})
+
+local runBtn = mk(runCard, "TextButton", {
+Size = UDim2.new(1, 0, 0, 44),
+BackgroundColor3 = C.ACCENT,
+Text = "START EXTRACTION",
+TextColor3 = C.TEXT,
+TextSize = 13,
+Font = F.BOLD,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(runBtn, 8)
+
+local progressBar = mk(runCard, "Frame", {
+Size = UDim2.new(1, 0, 0, 3),
+Position = UDim2.new(0, 0, 0, 48),
+BackgroundColor3 = C.HOVER,
+BorderSizePixel = 0,
+})
+corner(progressBar, 2)
+local progressFill = mk(progressBar, "Frame", {
+Size = UDim2.new(0, 0, 1, 0),
+BackgroundColor3 = C.ACCENT,
+BorderSizePixel = 0,
+})
+corner(progressFill, 2)
+
+local statusLabel = mk(runCard, "TextLabel", {
+Size = UDim2.new(1, 0, 0, 16),
+Position = UDim2.new(0, 0, 0, 56),
+BackgroundTransparency = 1,
+Text = "Ready",
+TextColor3 = C.TEXT_DIM,
+TextSize = 11,
+Font = F.REG,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local lastPathLabel = mk(runCard, "TextLabel", {
+Size = UDim2.new(1, 0, 0, 14),
+Position = UDim2.new(0, 0, 0, 74),
+BackgroundTransparency = 1,
+Text = "",
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.MONO,
+TextXAlignment = Enum.TextXAlignment.Left,
+TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+-- ═══════════════════════════════════════════════════════════════
+-- CONSOLE TAB
+-- ═══════════════════════════════════════════════════════════════
+
+local consoleTab = tabs["CONSOLE"].content
+
+local cToolbar = mk(consoleTab, "Frame", {
+Size = UDim2.new(1, -36, 0, 30),
+Position = UDim2.new(0, 18, 0, 10),
+BackgroundTransparency = 1,
+})
+
+local filterBtns = {}
+local function setFilter(f)
+filterState = f
+for k, b in pairs(filterBtns) do
+Tween:Create(b, TweenInfo.new(0.12), {
+BackgroundColor3 = (k == f) and C.ACCENT_D or C.HOVER,
+TextColor3 = (k == f) and C.TEXT or C.TEXT_DIM,
+}):Play()
+end
+rebuildConsole()
+end
+
+for i, f in ipairs({ "ALL", "INFO", "WARN", "ERR" }) do
+local b = mk(cToolbar, "TextButton", {
+Size = UDim2.new(0, 50, 0, 24),
+Position = UDim2.new(0, (i - 1) * 54, 0, 3),
+BackgroundColor3 = (f == "ALL") and C.ACCENT_D or C.HOVER,
+Text = f,
+TextColor3 = (f == "ALL") and C.TEXT or C.TEXT_DIM,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(b, 5)
+filterBtns[f] = b
+b.MouseButton1Click:Connect(function() setFilter(f) end)
+end
+
+local clearBtn = mk(cToolbar, "TextButton", {
+Size = UDim2.new(0, 54, 0, 24),
+Position = UDim2.new(1, -168, 0, 3),
+BackgroundColor3 = C.HOVER,
+Text = "CLEAR",
+TextColor3 = C.TEXT_DIM,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(clearBtn, 5)
+clearBtn.MouseButton1Click:Connect(function() logs = {}; rebuildConsole() end)
+
+local exportBtn = mk(cToolbar, "TextButton", {
+Size = UDim2.new(0, 54, 0, 24),
+Position = UDim2.new(1, -110, 0, 3),
+BackgroundColor3 = C.HOVER,
+Text = "EXPORT",
+TextColor3 = C.TEXT_DIM,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(exportBtn, 5)
+
+local autoBtn = mk(cToolbar, "TextButton", {
+Size = UDim2.new(0, 54, 0, 24),
+Position = UDim2.new(1, -52, 0, 3),
+BackgroundColor3 = C.ACCENT_D,
+Text = "AUTO",
+TextColor3 = C.TEXT,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(autoBtn, 5)
+autoBtn.MouseButton1Click:Connect(function()
+autoScroll = not autoScroll
+Tween:Create(autoBtn, TweenInfo.new(0.12), {
+BackgroundColor3 = autoScroll and C.ACCENT_D or C.HOVER,
+TextColor3 = autoScroll and C.TEXT or C.TEXT_DIM,
+}):Play()
+end)
+
+local logScroll = mk(consoleTab, "ScrollingFrame", {
+Size = UDim2.new(1, -36, 1, -56),
+Position = UDim2.new(0, 18, 0, 46),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+ScrollBarThickness = 4,
+ScrollBarImageColor3 = C.BORDER_HI,
+CanvasSize = UDim2.new(0, 0, 0, 0),
+})
+corner(logScroll, 8)
+mk(logScroll, "UIPadding", {
+PaddingTop = UDim.new(0, 6),
+PaddingBottom = UDim.new(0, 6),
+PaddingLeft = UDim.new(0, 10),
+PaddingRight = UDim.new(0, 10),
+})
+local logLayout = mk(logScroll, "UIListLayout", {
+Padding = UDim.new(0, 2),
+SortOrder = Enum.SortOrder.LayoutOrder,
+})
+
+local KIND_COLOR = { OUT = C.TEXT, INFO = C.INFO, WARN = C.WARN, ERR = C.ERR }
+
+local function renderLog(entry, order)
+return mk(logScroll, "TextLabel", {
+Size = UDim2.new(1, 0, 0, 0),
+AutomaticSize = Enum.AutomaticSize.Y,
+BackgroundTransparency = 1,
+Text = string.format("[%s] %s", os.date("%H:%M:%S", entry.time), entry.msg),
+TextColor3 = KIND_COLOR[entry.kind] or C.TEXT,
+TextSize = 11,
+Font = F.MONO,
+TextWrapped = true,
+TextXAlignment = Enum.TextXAlignment.Left,
+TextYAlignment = Enum.TextYAlignment.Top,
+LayoutOrder = order,
+})
+end
+
+function rebuildConsole()
+for _, c in ipairs(logScroll:GetChildren()) do
+if c:IsA("TextLabel") then c:Destroy() end
+end
+local order = 0
+for _, e in ipairs(logs) do
+if filterState == "ALL" or e.kind == filterState then
+order += 1
+renderLog(e, order)
+end
+end
+task.defer(function()
+logScroll.CanvasSize = UDim2.new(0, 0, 0, logLayout.AbsoluteContentSize.Y + 12)
+if autoScroll then
+logScroll.CanvasPosition = Vector2.new(0, logLayout.AbsoluteContentSize.Y)
+end
+end)
+end
+
+table.insert(listeners, function(entry)
+if activeName ~= "CONSOLE" then return end
+if filterState ~= "ALL" and entry.kind ~= filterState then return end
+local order = 0
+for _ in ipairs(logScroll:GetChildren()) do order += 1 end
+renderLog(entry, order)
+task.defer(function()
+logScroll.CanvasSize = UDim2.new(0, 0, 0, logLayout.AbsoluteContentSize.Y + 12)
+if autoScroll then
+logScroll.CanvasPosition = Vector2.new(0, logLayout.AbsoluteContentSize.Y)
+end
+end)
+end)
+
+exportBtn.MouseButton1Click:Connect(function()
+if not CAP.writefile then return end
+ensureFolder("SaveInstance")
+local path = "SaveInstance/console_" .. os.date("%Y%m%d_%H%M%S") .. ".txt"
+local lines = {}
+for _, e in ipairs(logs) do
+table.insert(lines, string.format("[%s] %s", os.date("%H:%M:%S", e.time), e.msg))
+end
+local ok = pcall(writefile, path, table.concat(lines, "\n"))
+exportBtn.Text = ok and "SAVED" or "FAILED"
+task.delay(1.2, function()
+exportBtn.Text = "EXPORT"
+exportBtn.TextColor3 = C.TEXT_DIM
+end)
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- OUTPUT TAB
+-- ═══════════════════════════════════════════════════════════════
+
+local outputTab = tabs["OUTPUT"].content
+
+local oToolbar = mk(outputTab, "Frame", {
+Size = UDim2.new(1, -36, 0, 30),
+Position = UDim2.new(0, 18, 0, 10),
+BackgroundTransparency = 1,
+})
+
+local outPathLabel = mk(oToolbar, "TextLabel", {
+Size = UDim2.new(1, -140, 1, 0),
+BackgroundTransparency = 1,
+Text = "Not scanned",
+TextColor3 = C.TEXT_DIM,
+TextSize = 11,
+Font = F.MONO,
+TextXAlignment = Enum.TextXAlignment.Left,
+TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+local copyPathBtn = mk(oToolbar, "TextButton", {
+Size = UDim2.new(0, 54, 0, 24),
+Position = UDim2.new(1, -116, 0, 3),
+BackgroundColor3 = C.HOVER,
+Text = "COPY",
+TextColor3 = C.TEXT_DIM,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(copyPathBtn, 5)
+
+local scanBtn = mk(oToolbar, "TextButton", {
+Size = UDim2.new(0, 54, 0, 24),
+Position = UDim2.new(1, -58, 0, 3),
+BackgroundColor3 = C.ACCENT_D,
+Text = "SCAN",
+TextColor3 = C.TEXT,
+TextSize = 10,
+Font = F.MED,
+BorderSizePixel = 0,
+AutoButtonColor = false,
+})
+corner(scanBtn, 5)
+
+local outScroll = mk(outputTab, "ScrollingFrame", {
+Size = UDim2.new(1, -36, 1, -110),
+Position = UDim2.new(0, 18, 0, 46),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+ScrollBarThickness = 4,
+ScrollBarImageColor3 = C.BORDER_HI,
+CanvasSize = UDim2.new(0, 0, 0, 0),
+})
+corner(outScroll, 8)
+mk(outScroll, "UIPadding", {
+PaddingTop = UDim.new(0, 6),
+PaddingBottom = UDim.new(0, 6),
+PaddingLeft = UDim.new(0, 10),
+PaddingRight = UDim.new(0, 10),
+})
+local outLayout = mk(outScroll, "UIListLayout", {
+Padding = UDim.new(0, 4),
+SortOrder = Enum.SortOrder.LayoutOrder,
+})
+
+local outFooter = mk(outputTab, "Frame", {
+Size = UDim2.new(1, -36, 0, 52),
+Position = UDim2.new(0, 18, 1, -62),
+BackgroundColor3 = C.SURFACE,
+BorderSizePixel = 0,
+})
+corner(outFooter, 8)
+
+mk(outFooter, "TextLabel", {
+Size = UDim2.new(1, -20, 0, 14),
+Position = UDim2.new(0, 14, 0, 8),
+BackgroundTransparency = 1,
+Text = "TOTAL",
+TextColor3 = C.TEXT_MUT,
+TextSize = 10,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local outTotalLabel = mk(outFooter, "TextLabel", {
+Size = UDim2.new(1, -20, 0, 20),
+Position = UDim2.new(0, 14, 0, 24),
+BackgroundTransparency = 1,
+Text = "--",
+TextColor3 = C.TEXT,
+TextSize = 14,
+Font = F.BOLD,
+TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local function scanOutput(folder)
+folder = folder or "SaveInstance"
+if not CAP.isfolder or not isfolder(folder) then
+outPathLabel.Text = "Folder not found"
+return
+end
+lastFolderPath = folder
+outPathLabel.Text = folder
+for _, c in ipairs(outScroll:GetChildren()) do
+if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+end
+if not CAP.listfiles then
+outTotalLabel.Text = "listfiles unavailable"
+return
+end
+local ok, files = pcall(listfiles, folder)
+if not ok or type(files) ~= "table" then
+outTotalLabel.Text = "read error"
+return
+end
+local entries = {}
+for _, f in ipairs(files) do
+if CAP.isfile and not isfile(f) then continue end
+local size = safeFileSize(f) or 0
+table.insert(entries, { path = f, name = f:match("[^/\]+$") or f, size = size })
+end
+table.sort(entries, function(a, b) return a.size > b.size end)
+local total = 0
+for i, f in ipairs(entries) do
+total += f.size
+local row = mk(outScroll, "Frame", {
+Size = UDim2.new(1, 0, 0, 24),
+BackgroundTransparency = 1,
+LayoutOrder = i,
+})
+mk(row, "TextLabel", {
+Size = UDim2.new(1, -100, 1, 0),
+BackgroundTransparency = 1,
+Text = f.name,
+TextColor3 = C.TEXT,
+TextSize = 11,
+Font = F.MONO,
+TextXAlignment = Enum.TextXAlignment.Left,
+TextTruncate = Enum.TextTruncate.AtEnd,
+})
+mk(row, "TextLabel", {
+Size = UDim2.new(0, 90, 1, 0),
+Position = UDim2.new(1, -90, 0, 0),
+BackgroundTransparency = 1,
+Text = fmtBytes(f.size),
+TextColor3 = C.TEXT_DIM,
+TextSize = 11,
+Font = F.MONO,
+TextXAlignment = Enum.TextXAlignment.Right,
+})
+end
+if #entries == 0 then
+mk(outScroll, "TextLabel", {
+Size = UDim2.new(1, 0, 0, 20),
+BackgroundTransparency = 1,
+Text = "Empty folder",
+TextColor3 = C.TEXT_MUT,
+TextSize = 11,
+Font = F.REG,
+LayoutOrder = 1,
+})
+end
+task.defer(function()
+outScroll.CanvasSize = UDim2.new(0, 0, 0, outLayout.AbsoluteContentSize.Y + 12)
+end)
+outTotalLabel.Text = string.format("%s | %d files", fmtBytes(total), #entries)
+end
+
+scanBtn.MouseButton1Click:Connect(function()
+scanOutput(lastFolderPath or "SaveInstance")
+end)
+
+copyPathBtn.MouseButton1Click:Connect(function()
+if lastFolderPath and CAP.setclipboard then
+pcall(setclipboard, lastFolderPath)
+copyPathBtn.Text = "COPIED"
+task.delay(1, function()
+copyPathBtn.Text = "COPY"
+copyPathBtn.TextColor3 = C.TEXT_DIM
+end)
+end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- HELP TAB
+-- ═══════════════════════════════════════════════════════════════
+
+local helpTab = tabs["HELP"].content
+
+local helpScroll = mk(helpTab, "ScrollingFrame", {
+Size = UDim2.new(1, -36, 1, -20),
+Position = UDim2.new(0, 18, 0, 10),
+BackgroundTransparency = 1,
+BorderSizePixel = 0,
+ScrollBarThickness = 4,
+ScrollBarImageColor3 = C.BORDER_HI,
+CanvasSize = UDim2.new(0, 0, 0, 0),
+AutomaticCanvasSize = Enum.AutomaticSize.Y,
+})
+mk(helpScroll, "UIPadding", {
+PaddingBottom = UDim.new(0, 20),
+PaddingRight = UDim.new(0, 6),
+})
+mk(helpScroll, "UIListLayout", {
+Padding = UDim.new(0, 6),
+SortOrder = Enum.SortOrder.LayoutOrder,
+})
+
+local helpOrder = 0
+local function next
